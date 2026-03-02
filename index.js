@@ -6,12 +6,11 @@ const PORT = 3000;
 // Header HTTP
 const ALIEN_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15 QuantumBrowser/99.9';
 
-// Script Suntikan: DevTools (Eruda) + Spek Alien + Bypass Restricted API
+// Script Suntikan: DevTools (Eruda) + Spek Alien
 const SPOOF_SCRIPT = `
 <script src="https://cdn.jsdelivr.net/npm/eruda"></script>
 <script>
-    // 1. Inisialisasi Dev Tools (Muncul icon gear melayang di pojok layar)
-    eruda.init();
+    eruda.init(); // DevTools aktif
 
     const customUA = '${ALIEN_USER_AGENT}';
     Object.defineProperty(navigator, 'userAgent', {get: () => customUA});
@@ -21,11 +20,9 @@ const SPOOF_SCRIPT = `
     Object.defineProperty(navigator, 'deviceMemory', {get: () => 2048}); 
     Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 1024});
 
-    // 2. Bypass Battery & Permissions Restricted
     const mockBattery = { level: 10.0, charging: true, chargingTime: 0, dischargingTime: Infinity, addEventListener: () => {} };
     Object.defineProperty(navigator, 'getBattery', { value: () => Promise.resolve(mockBattery) });
     
-    // Nipu izin browser biar dikira ngizinin akses baterai
     if (navigator.permissions && navigator.permissions.query) {
         const originalQuery = navigator.permissions.query;
         navigator.permissions.query = (ext) => {
@@ -34,7 +31,6 @@ const SPOOF_SCRIPT = `
         };
     }
 
-    // 3. Sensor Tambahan
     Object.defineProperty(navigator, 'language', {get: () => 'ja-JP'});
     Object.defineProperty(navigator, 'languages', {get: () => ['ja-JP', 'ja', 'en-US', 'en']});
     Date.prototype.getTimezoneOffset = () => -540;
@@ -44,7 +40,7 @@ const SPOOF_SCRIPT = `
 app.get('/', (req, res) => {
     res.send(`
         <div style="font-family: sans-serif; text-align: center; margin-top: 50px; background-color: #1a1a1a; color: #00ff00; padding: 50px; border-radius: 10px;">
-            <h2>🛸 Alien Stealth Proxy (Full Nav & DevTools)</h2>
+            <h2>🛸 Alien Stealth Proxy (Full Nav Fix)</h2>
             <form action="/proxy" method="GET">
                 <input type="text" name="url" placeholder="Contoh: https://deviceinfo.me" style="width: 350px; padding: 10px; border-radius: 5px; border: none;" required>
                 <button type="submit" style="padding: 10px; cursor: pointer; background-color: #00ff00; color: #000; font-weight: bold; border-radius: 5px; border: none;">Teleportasi!</button>
@@ -58,8 +54,10 @@ app.get('/proxy', async (req, res) => {
     let targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send('URL-nya masukin dulu bro!');
 
-    // Tambahin https:// kalau lu lupa ngetik
-    if (!targetUrl.startsWith('http')) targetUrl = 'https://' + targetUrl;
+    // Kalau lu lupa ngetik http/https, otomatis ditambahin
+    if (!/^https?:\/\//i.test(targetUrl)) {
+        targetUrl = 'https://' + targetUrl;
+    }
 
     try {
         const response = await axios.get(targetUrl, {
@@ -75,40 +73,33 @@ app.get('/proxy', async (req, res) => {
         const contentType = response.headers['content-type'] || '';
         res.set('Content-Type', contentType);
 
-        // 4. Logika URL Rewriter (Biar bisa pindah halaman & CSS kebaca)
         if (contentType.includes('text/html')) {
             let htmlData = response.data.toString('utf-8');
             
-            // Suntik DevTools dan Sensor
+            // Suntik Script & DevTools
             htmlData = htmlData.replace('<head>', '<head>' + SPOOF_SCRIPT);
 
-            // Parsing URL asli
-            const targetObj = new URL(targetUrl);
-            const baseOrigin = targetObj.origin;
-            const basePath = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
-
-            // Regex buat ngubah semua href="" dan src="" biar lewat proxy kita
+            // LOGIKA URL REWRITER YANG UDAH DI-FIX
             htmlData = htmlData.replace(/(href|src|action)=["'](.*?)["']/gi, (match, attr, link) => {
-                // Biarin aja kalau linknya cuma format data/javascript
-                if (link.startsWith('data:') || link.startsWith('javascript:') || link.startsWith('#')) return match;
-                
-                let absoluteLink = link;
-                if (link.startsWith('//')) {
-                    absoluteLink = 'https:' + link;
-                } else if (link.startsWith('/')) {
-                    absoluteLink = baseOrigin + link;
-                } else if (!link.startsWith('http')) {
-                    absoluteLink = basePath + link;
+                // Jangan utak-atik script bawaan browser atau anchor
+                if (link.startsWith('data:') || link.startsWith('javascript:') || link.startsWith('#')) {
+                    return match;
                 }
                 
-                // Belokkan link target ke sistem proxy kita
-                return `${attr}="/proxy?url=${encodeURIComponent(absoluteLink)}"`;
+                try {
+                    // Ini mesin pintarnya: otomatis gabungin "phone.html" sama "https://domain.com"
+                    const absoluteUrl = new URL(link, targetUrl).href;
+                    
+                    // Terus ubah jadinya gini -> /proxy?url=https://domain.com/phone.html
+                    return `${attr}="/proxy?url=${encodeURIComponent(absoluteUrl)}"`;
+                } catch (e) {
+                    return match; // Kalau URL-nya cacat dari sananya, biarin aja
+                }
             });
 
             return res.send(htmlData);
         }
 
-        // Kalau yang diakses murni file CSS/Gambar/JS, kirim langsung
         res.send(response.data);
 
     } catch (error) {
