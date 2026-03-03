@@ -8,149 +8,167 @@ const crypto = require('crypto');
 const app = express();
 app.use(express.json());
 
-// --- KONFIGURASI ---
-const MASTER_KEY = 'dezz-admin-rahasia'; // GANTI INI!
+// --- DATABASE MOCKING (Persist ke File) ---
 const DATA_DIR = path.join(__dirname, 'data');
-const KEYS_FILE = path.join(__dirname, 'keys.json');
+const DB_FILE = path.join(__dirname, 'internal_db.json');
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
-if (!fs.existsSync(KEYS_FILE)) fs.writeFileSync(KEYS_FILE, JSON.stringify({}));
+if (!fs.existsSync(DB_FILE)) {
+    fs.writeFileSync(DB_FILE, JSON.stringify({ 
+        keys: {}, 
+        bans: [], 
+        config: { master_key: 'dezz_admin_pro' } 
+    }));
+}
 
-// --- DATABASE HELPER ---
-const getKeys = () => JSON.parse(fs.readFileSync(KEYS_FILE));
-const saveKeys = (keys) => fs.writeFileSync(KEYS_FILE, JSON.stringify(keys, null, 2));
+const getDB = () => JSON.parse(fs.readFileSync(DB_FILE));
+const saveDB = (db) => fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
 
-// --- SECURITY & LIMITER ---
-const publicLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 50,
-    message: { error: 'Terlalu banyak request. Coba lagi nanti.' }
-});
-
-const auth = (req, res, next) => {
-    const userKey = req.headers['x-api-key'];
-    const keys = getKeys();
-    if (userKey === MASTER_KEY) return next();
-    if (keys[userKey] && !keys[userKey].revoked) return next();
-    res.status(401).json({ error: 'API Key Ilegal atau sudah di-Revoke!' });
+// --- SPAM PROTECTION & BAN SYSTEM ---
+const checkBan = (req, res, next) => {
+    const db = getDB();
+    if (db.bans.includes(req.ip)) {
+        return res.status(403).send(`
+            <body style="background:#0b0f1a;color:#ff4d4d;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;flex-direction:column;">
+                <h1>IP LU KENA BAN!</h1>
+                <p>Terdeteksi Spam Berlebihan. Hubungi Admin buat Unban.</p>
+                <a href="https://t.me/your_telegram" style="color:white">Minta Unban</a>
+            </body>
+        `);
+    }
+    next();
 };
 
-// --- API ENDPOINTS ---
-app.post('/api/key/generate', publicLimiter, (req, res) => {
-    const newKey = `dezz_${crypto.randomBytes(8).toString('hex')}`;
-    const keys = getKeys();
-    keys[newKey] = {
-        ip: req.ip,
-        createdAt: new Date().toISOString(),
-        revoked: false
-    };
-    saveKeys(keys);
-    res.json({ success: true, key: newKey });
-});
-
-app.post('/api/key/revoke', (req, res) => {
-    if (req.headers['x-api-key'] !== MASTER_KEY) return res.status(403).send('Forbidden');
-    const { targetKey } = req.body;
-    const keys = getKeys();
-    if (keys[targetKey]) {
-        keys[targetKey].revoked = true;
-        saveKeys(keys);
-        res.json({ success: true, message: `Key ${targetKey} dicabut!` });
-    } else {
-        res.status(404).json({ error: 'Key gak ketemu.' });
+const apiLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000,
+    max: 50,
+    handler: (req, res) => {
+        const db = getDB();
+        // Logikanya: Kalo kena limit, catat. Kalo sering, ban.
+        if (!db.bans.includes(req.ip)) db.bans.push(req.ip);
+        saveDB(db);
+        res.status(429).json({ error: 'Spam terdeteksi! IP lu otomatis diblokir.' });
     }
 });
 
-app.post('/api/db/:nama', auth, (req, res) => {
-    fs.writeFileSync(path.join(DATA_DIR, `${req.params.nama}.json`), JSON.stringify(req.body, null, 2));
+app.use(checkBan);
+
+// --- AUTH MIDDLEWARE ---
+const authorize = (permission) => {
+    return (req, res, next) => {
+        const key = req.headers['x-api-key'];
+        const db = getDB();
+        
+        if (key === db.config.master_key) return next();
+        
+        const keyData = db.keys[key];
+        if (keyData && !keyData.revoked && keyData.perms.includes(permission)) {
+            return next();
+        }
+        res.status(403).json({ error: `Gak punya akses: ${permission}` });
+    };
+};
+
+// ==========================================
+// 🚀 API ROUTES
+// ==========================================
+
+// Create Key (Admin Only or Master)
+app.post('/api/admin/create-key', (req, res) => {
+    const { master, name, perms } = req.body; // perms: ['READ', 'WRITE']
+    const db = getDB();
+    if (master !== db.config.master_key) return res.status(401).send('Unauthorized');
+
+    const newKey = `plta_${crypto.randomBytes(12).toString('hex')}`;
+    db.keys[newKey] = { name, perms, revoked: false, ip: req.ip };
+    saveDB(db);
+    res.json({ success: true, key: newKey });
+});
+
+// Unban IP (Admin Only)
+app.post('/api/admin/unban', (req, res) => {
+    const { master, ip } = req.body;
+    const db = getDB();
+    if (master !== db.config.master_key) return res.status(401).send('Unauthorized');
+    db.bans = db.bans.filter(b => b !== ip);
+    saveDB(db);
     res.json({ success: true });
 });
 
-app.get('/api/db/:nama', auth, (req, res) => {
-    const p = path.join(DATA_DIR, `${req.params.nama}.json`);
+// CRUD Data with Granular Perms
+app.get('/api/db/:name', authorize('READ'), (req, res) => {
+    const p = path.join(DATA_DIR, `${req.params.name}.json`);
     if (fs.existsSync(p)) res.json(JSON.parse(fs.readFileSync(p)));
-    else res.status(404).json({ error: 'Data kosong.' });
+    else res.status(404).json({ error: 'Not Found' });
 });
 
-// --- UI JOKO-STYLE ---
+app.post('/api/db/:name', authorize('WRITE'), (req, res) => {
+    fs.writeFileSync(path.join(DATA_DIR, `${req.params.name}.json`), JSON.stringify(req.body, null, 2));
+    res.json({ success: true });
+});
+
+app.delete('/api/db/:name', authorize('DELETE'), (req, res) => {
+    const p = path.join(DATA_DIR, `${req.params.name}.json`);
+    if (fs.existsSync(p)) {
+        fs.unlinkSync(p);
+        res.json({ success: true });
+    } else res.status(404).send('Not Found');
+});
+
+// ==========================================
+// 🎨 UI (JOKO-UI V2)
+// ==========================================
+
+const UI_HEADER = `
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;800&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Plus Jakarta Sans', sans-serif; background: #0b0f1a; color: #e2e8f0; }
+        .glass { background: rgba(22, 27, 44, 0.8); backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.05); }
+    </style>
+`;
+
+// Dashboard Public
 app.get('/', (req, res) => {
-    const files = fs.readdirSync(DATA_DIR).filter(f => f.endsWith('.json'));
     res.send(`
     <!DOCTYPE html>
-    <html lang="id">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Dezz DB | JokoUI</title>
-        <script src="https://cdn.tailwindcss.com"></script>
-        <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;800&display=swap" rel="stylesheet">
-        <style>body { font-family: 'Plus Jakarta Sans', sans-serif; background: #0b0f1a; }</style>
-    </head>
-    <body class="text-gray-200 p-6">
-        <div class="max-w-5xl mx-auto">
-            <nav class="flex justify-between items-center mb-12 bg-[#161b2c] p-5 rounded-2xl border border-gray-800 shadow-2xl">
-                <h1 class="text-xl font-800 tracking-tighter text-white">DEZZ<span class="text-blue-500">DB.</span></h1>
+    <html>
+    <head>${UI_HEADER}<title>DezzDB Dashboard</title></head>
+    <body class="p-6">
+        <div class="max-w-4xl mx-auto">
+            <nav class="flex justify-between items-center mb-10 glass p-5 rounded-2xl">
+                <h1 class="text-2xl font-800 tracking-tighter text-white italic">DEZZ<span class="text-blue-500">DB</span></h1>
                 <div class="flex gap-4">
-                    <button onclick="generateKey()" class="bg-blue-600 hover:bg-blue-500 text-white px-5 py-2 rounded-xl text-sm font-semibold transition-all shadow-lg shadow-blue-500/20">Get API Key</button>
+                    <a href="/docs" class="text-sm text-gray-400 mt-2">Docs</a>
+                    <button onclick="reqKey()" class="bg-blue-600 px-4 py-2 rounded-xl font-bold text-sm">Request Access</button>
                 </div>
             </nav>
-
-            <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
-                <div class="lg:col-span-2 space-y-8">
-                    <div class="bg-gradient-to-br from-blue-600/20 to-purple-600/10 p-10 rounded-[2rem] border border-blue-500/20 shadow-inner">
-                        <h2 class="text-4xl font-800 text-white mb-4 leading-tight">Build faster <br>with JSON storage.</h2>
-                        <p class="text-gray-400 mb-8 max-w-md">Database minimalis untuk project lu. Support Per-IP Key, Auto Backup, dan tampilan JokoUI.</p>
-                        <div class="bg-black/60 p-5 rounded-2xl font-mono text-sm text-blue-400 border border-white/5 shadow-2xl">
-                            <span class="text-gray-500">// Simpan data</span><br>
-                            POST /api/db/project-gua<br>
-                            x-api-key: YOUR_KEY
-                        </div>
+            <div class="glass p-10 rounded-[2.5rem] border-t border-white/10 text-center">
+                <h2 class="text-5xl font-800 text-white mb-4">JSON Storage <br>For High-Performers.</h2>
+                <p class="text-gray-500 mb-8 text-lg">Kelola data JSON lu dengan akses PLTA granular. Aman, Cepat, Terstruktur.</p>
+                <div class="flex justify-center gap-4">
+                    <div class="bg-black/40 p-4 rounded-2xl border border-white/5 w-40">
+                        <p class="text-xs text-gray-500 uppercase">Uptime</p>
+                        <p class="text-xl font-bold text-emerald-400">99.9%</p>
                     </div>
-
-                    <div class="bg-[#161b2c] p-8 rounded-[2rem] border border-gray-800">
-                        <h3 class="text-lg font-bold mb-6 text-white flex items-center gap-2">
-                            <span class="w-2 h-2 bg-blue-500 rounded-full animate-pulse"></span>
-                            Interactive Docs
-                        </h3>
-                        <div class="space-y-6">
-                            <div class="group border-l-2 border-blue-500/30 hover:border-blue-500 pl-6 transition-all">
-                                <p class="text-sm font-bold text-blue-400 uppercase tracking-widest">Generate Key</p>
-                                <p class="text-xs text-gray-500 mt-1 italic">POST /api/key/generate (No Auth)</p>
-                            </div>
-                            <div class="group border-l-2 border-emerald-500/30 hover:border-emerald-500 pl-6 transition-all">
-                                <p class="text-sm font-bold text-emerald-400 uppercase tracking-widest">Store Data</p>
-                                <p class="text-xs text-gray-500 mt-1 italic">POST /api/db/:name (Need Auth)</p>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="space-y-6">
-                    <div class="bg-[#161b2c] p-8 rounded-[2rem] border border-gray-800 shadow-xl">
-                        <h3 class="text-xs font-bold text-gray-500 uppercase tracking-[0.2em] mb-6 text-center">Active Storage</h3>
-                        <div class="space-y-3">
-                            ${files.length > 0 ? files.map(f => `
-                                <div class="flex justify-between items-center bg-black/40 p-4 rounded-2xl border border-white/5 hover:border-blue-500/30 transition-all">
-                                    <span class="text-sm text-gray-300 font-mono font-semibold">${f.replace('.json', '')}</span>
-                                    <span class="text-[10px] bg-blue-500/20 text-blue-400 px-3 py-1 rounded-full font-bold">JSON</span>
-                                </div>
-                            `).join('') : '<p class="text-center text-gray-600 text-sm py-4 italic">No data yet.</p>'}
-                        </div>
-                        <a href="/backup" class="block text-center mt-8 text-xs text-gray-500 hover:text-blue-400 underline underline-offset-4">Download All Backup (.zip)</a>
+                    <div class="bg-black/40 p-4 rounded-2xl border border-white/5 w-40">
+                        <p class="text-xs text-gray-500 uppercase">Type</p>
+                        <p class="text-xl font-bold text-blue-400">PLTA Auth</p>
                     </div>
                 </div>
             </div>
         </div>
-
         <script>
-            async function generateKey() {
-                const res = await fetch('/api/key/generate', { method: 'POST' });
-                const data = await res.json();
-                if(data.key) {
-                    prompt('COPY & SIMPAN KEY INI BRO (Jangan sampe ilang):', data.key);
-                } else {
-                    alert('Limit tercapai. Coba beberapa menit lagi.');
-                }
+            function reqKey() {
+                Swal.fire({
+                    title: 'Request API Key',
+                    text: 'Key publik terbatas. Hubungi Admin buat full access (Read/Write/Delete).',
+                    icon: 'info',
+                    background: '#161b2c',
+                    color: '#fff',
+                    confirmButtonColor: '#2563eb'
+                });
             }
         </script>
     </body>
@@ -158,13 +176,73 @@ app.get('/', (req, res) => {
     `);
 });
 
-app.get('/backup', (req, res) => {
-    const archive = archiver('zip', { zlib: { level: 9 } });
-    res.attachment(`backup-${Date.now()}.zip`);
-    archive.pipe(res);
-    archive.directory(DATA_DIR, false);
-    archive.finalize();
+// Admin Page
+app.get('/admin', (req, res) => {
+    const db = getDB();
+    const bannedIps = db.bans.map(ip => `
+        <div class="flex justify-between p-3 bg-red-500/10 border border-red-500/20 rounded-xl mb-2">
+            <span class="font-mono text-red-400">${ip}</span>
+            <button onclick="unban('${ip}')" class="text-xs bg-red-600 px-2 py-1 rounded-lg">Unban</button>
+        </div>
+    `).join('');
+
+    res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>${UI_HEADER}<title>Admin Panel</title></head>
+    <body class="p-8">
+        <div class="max-w-6xl mx-auto grid grid-cols-1 md:grid-cols-3 gap-8">
+            <div class="md:col-span-2 space-y-6">
+                <h1 class="text-3xl font-800">Admin Control</h1>
+                <div class="glass p-6 rounded-3xl">
+                    <h3 class="mb-4 font-bold">Generate New Key (PLTA)</h3>
+                    <div class="space-y-4">
+                        <input id="keyName" placeholder="Nama Project" class="w-full bg-black/20 p-3 rounded-xl border border-white/10">
+                        <div class="flex gap-2">
+                            <label><input type="checkbox" class="perm" value="READ" checked> READ</label>
+                            <label><input type="checkbox" class="perm" value="WRITE"> WRITE</label>
+                            <label><input type="checkbox" class="perm" value="DELETE"> DELETE</label>
+                        </div>
+                        <button onclick="createKey()" class="w-full bg-emerald-600 p-3 rounded-xl font-bold">Generate Key</button>
+                    </div>
+                </div>
+            </div>
+            <div class="glass p-6 rounded-3xl">
+                <h3 class="font-bold mb-4 text-red-500">Banned IPs (${db.bans.length})</h3>
+                ${bannedIps || '<p class="text-gray-600">Gak ada IP diblokir.</p>'}
+            </div>
+        </div>
+        <script>
+            const mKey = () => localStorage.getItem('master_key') || prompt('Masukkan Master Key:');
+            
+            async function createKey() {
+                const name = document.getElementById('keyName').value;
+                const perms = Array.from(document.querySelectorAll('.perm:checked')).map(el => el.value);
+                const res = await fetch('/api/admin/create-key', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ master: mKey(), name, perms })
+                });
+                const data = await res.json();
+                if(data.key) {
+                    localStorage.setItem('master_key', mKey());
+                    Swal.fire({ title: 'Key Created!', text: data.key, icon: 'success', background: '#161b2c', color: '#fff' });
+                }
+            }
+
+            async function unban(ip) {
+                await fetch('/api/admin/unban', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ master: mKey(), ip })
+                });
+                location.reload();
+            }
+        </script>
+    </body>
+    </html>
+    `);
 });
 
 const PORT = 3000;
-app.listen(PORT, () => console.log(`✅ Serverless DB ready on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 DB Serverless God Mode on port ${PORT}`));
